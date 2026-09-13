@@ -1,0 +1,8 @@
+# Dependencies (installed via pnpm; not vendored)
+node_modules/
+
+# Tool / test caches
+*.tsbuildinfo
+
+# OS
+.DS_Store

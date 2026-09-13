@@ -1,0 +1,9 @@
+{
+  "//": "Node-safe boundary guard: typecheck the node-reachable surface WITHOUT the DOM lib. A DOM type leaking into the root or the node-safe subpaths fails here.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": ["tests/node-safe.ts"]
+}
