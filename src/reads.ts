@@ -39,6 +39,10 @@ export * from './ensure-mixins.ts'
 // `delete_file`. Pure + renderer-safe; its `{ key, value }` shape is the twin of
 // `commit_meta`'s `trailers` (`WireTrailer`), so it rides `./reads` too.
 export * from './attribution.ts'
+// The human-facing `WireShape` renderers (`shapeLabel` / `describeShape`). Pure
+// + renderer-safe, and the SDK owns `WireShape`, so they ride the `./reads`
+// subpath alongside the shape they render.
+export * from './shape-render.ts'
 // `export *` re-exports but does not bind locally; `WireMutateResult` uses the
 // type directly, so import it explicitly too.
 import type { EnsureMixinOutcome } from './ensure-mixins.ts'
@@ -124,9 +128,47 @@ export interface WireDiagnosticSpan {
   line_col?: WireLineColRange
 }
 
-/** Advisory text only — never auto-applied. */
+/**
+ * A suggested fix: the human-readable `description`, plus optional
+ * machine-applicable `actions`. `description` is always present (the label and
+ * advisory fallback); `actions` is absent when empty, so an advisory-only fix is
+ * byte-identical to before this field existed. The serde form of
+ * `au_diagnostics::SuggestedFix`, serialized directly — it rides every surface a
+ * diagnostic does (`diagnostics`, `overview`, `validate_value`, ...). Additive,
+ * no `schema_version` bump. See WIRE.md, the `diagnostics` read's `fix`.
+ */
 export interface WireSuggestedFix {
+  /** The human-readable label and advisory fallback. Always present. */
   description: string
+  /**
+   * Machine-applicable actions, absent when empty. A LIST, so a fix may offer a
+   * CHOICE of alternatives (e.g. among candidate rename targets); a single fix
+   * is a length-1 list. A consumer renders a generic apply button per action
+   * with NO per-code switch — see the SDK's `appliableFix`.
+   */
+  actions?: WireFixAction[]
+}
+
+/**
+ * One machine-applicable fix action: a real mutation `verb` plus the args the
+ * engine parsed. NOT a parallel intent vocabulary — `verb` names a mutation from
+ * the engine's `mutate` catalog (e.g. `add_dep`), so a consumer runs
+ * `mutateByVerb(verb, { ...args, ...topology })` directly.
+ */
+export interface WireFixAction {
+  /** A mutation verb from the `mutate` catalog to run (e.g. `add_dep`). */
+  verb: string
+  /** This action's human label (a button caption). */
+  title: string
+  /**
+   * The engine-supplied args, keyed by the VERB's OWN argument names, so they
+   * splat straight into the mutation call. Absent when empty. PARTIAL by design:
+   * the engine supplies what it parsed; the consumer completes workspace-topology
+   * args it owns (e.g. `add_dep`'s `root`, derived from `resolve_member`, is NOT
+   * carried). Values are strings today (may widen to a richer JSON value
+   * additively).
+   */
+  args?: Record<string, string>
 }
 
 /**
@@ -376,10 +418,11 @@ export interface WireDiagnosticCountsResult {
  * changed `path`; an empty `commits` means `commit` is a pre-existing HEAD.
  *
  * `last_live_commit` is the DELETE-only tombstone anchor — set ONLY by a
- * `delete_file` mutation, and only on-git. It is the LAST-LIVE commit, the
- * parent of the deletion commit (HEAD immediately before the delete), the last
- * commit where the file still EXISTED. Absent off-git (no deletion commit,
- * nothing to pin) and absent on every non-delete primitive.
+ * `delete_file` or `delete_dir` mutation, and only when it committed. It is the
+ * LAST-LIVE commit, the parent of the deletion commit (HEAD immediately before
+ * the delete), the last commit where the file (for `delete_dir`, every deleted
+ * file) still EXISTED. Absent off-git (no deletion commit, nothing to pin), on a
+ * delete of only git-ignored files, and on every non-delete primitive.
  *
  * PIN A DELETE TOMBSTONE AT THIS, NOT AT `commit`. `commit` / `commits` name the
  * DELETION commit, where the file is ABSENT — a tombstone pinned there resolves
@@ -400,12 +443,39 @@ export interface WireMutateResult {
   commit: string | null
   commits: Record<string, string>
   /**
+   * The absolute paths this mutation wrote, moved, or removed OUTSIDE git,
+   * path-sorted, `[]` when none. A file git ignores and never tracked (a
+   * `.DS_Store`) cannot be staged, so the engine writes it without a commit (never
+   * in `commits`) and restores it on a failed mutation. Both sides of a move are
+   * listed when both are outside git. Always present.
+   */
+  untracked_files: string[]
+  /**
    * The delete tombstone's pin anchor: the last commit where the file existed
-   * (parent of the deletion commit). Present ONLY on a `delete_file` result and
-   * only on-git; absent elsewhere. See the type doc — a delete tombstone pins
-   * THIS, never `commit`.
+   * (parent of the deletion commit). Present ONLY on a `delete_file` /
+   * `delete_dir` result that committed; absent elsewhere. See the type doc — a
+   * delete tombstone pins THIS, never `commit`.
    */
   last_live_commit?: string
+  /**
+   * The referrers whose bytes a `move_dir` changed, each at the path it ends at
+   * (a moved referrer under `to`). Present ONLY on a `move_dir` result. The shape
+   * of the rename preview's `rewrites`.
+   */
+  rewrites?: WireRewrite[]
+  /**
+   * Every surviving file referencing a file a `delete_dir` removed. Present ONLY
+   * on a `delete_dir` result. The delete proceeds whatever this holds; the links
+   * dangle after the rebuild.
+   */
+  stranded?: WireStranded[]
+  /**
+   * The absolute directories a folder op created, moved, or removed that no
+   * commit records (git tracks files, never directories), path-sorted, `[]` when
+   * none. An empty directory, or one holding only git-ignored files. Present ONLY
+   * on a `move_dir` / `delete_dir` result.
+   */
+  untracked_dirs?: string[]
   id?: string
   ref?: string
   /**
@@ -613,6 +683,34 @@ export interface WireMetaBlock {
 }
 
 /**
+ * A meta type's IDENTITY on an `effective_meta` entry, not a repo: an in-sync
+ * own and peer copy are ONE identity, `type_owners` listing every repo that
+ * defines it; a diverged pair are two. An unresolvable meta type keeps its entry
+ * with `hash: ""` and `type_owners: []`, so its block stays visible.
+ */
+export interface WireMetaTypeIdentity {
+  name: string
+  /** The closure-hash identity, hex; `""` when the meta type does not resolve. */
+  hash: string
+  type_owners: string[]
+}
+
+/**
+ * A surviving meta block on `effective_meta`: the `meta_blocks` shape as written
+ * on its DECLARING def (`type_name` relative to that def's repo, `source` in
+ * that def's file, which may be a peer's), plus `from`, the declaring def.
+ */
+export interface WireInheritedMetaBlock extends WireMetaBlock {
+  from: WireTypeIdentity
+}
+
+/** One `effective_meta` entry: a meta type identity and its surviving blocks. */
+export interface WireEffectiveMeta {
+  meta_type: WireMetaTypeIdentity
+  blocks: WireInheritedMetaBlock[]
+}
+
+/**
  * A type-def's BRAND, present on `WireTypeDef.brand` when the def declares a
  * `shape:` instead of `fields:` — naming a reusable, documented, queryable type
  * (a branded scalar, named enum, named union, or tuple). Absent for a record
@@ -694,6 +792,26 @@ export interface WireTypeDef {
    * key, `[]` for explicit empty `body: []`.
    */
   body: WireBodyItem[] | null
+  /**
+   * The inherited, resolved field set: the fields the validator checks an
+   * instance of this type against, in the `type_closure` `fields` shape. `fields`
+   * stays the def's OWN declarations. A field auto-unified across origins is one
+   * entry, its lex-min origin. A DIVERGENT field is one entry PER ORIGIN, each
+   * `divergent: true` with that origin's own `shape` / `required`, so a `name`
+   * can repeat: key by `(name, origin)`, never by `name` alone. Additive, no
+   * `schema_version` bump.
+   */
+  effective_fields: WireClosureField[]
+  /**
+   * The inherited, resolved meta: one entry per meta type IDENTITY with a
+   * surviving block, ordered by meta type. `meta_blocks` stays the def's OWN.
+   * A block survives unless a declaration of its meta type on a strict
+   * descendant shadows it; `meta: []` shadows every ancestor's meta on every
+   * path. Order- and path-independent. More than one block in an entry is
+   * reported whole, none picked (`meta-inheritance-conflict` across defs,
+   * `duplicate-meta-block` within one). Additive, no `schema_version` bump.
+   */
+  effective_meta: WireEffectiveMeta[]
   /** Post-splice template, every top-level `use:` resolved. `null` when no own body. */
   effective_body: WireBodyItem[] | null
   /**
@@ -745,11 +863,12 @@ export interface WireTypesArgs {
 /**
  * The lightweight `summary` projection of a `types` entry: the identity and
  * navigation fields, with the same values and semantics they carry on a full
- * `WireTypeDef`. The heavy detail (`fields`, `meta_blocks`, `body`,
- * `effective_body`, `source`, and the `abstract` / `required_meta` /
- * `unmet_required_meta` batch) is dropped — the full `types` read or the single
- * `type` read serves it, keyed by the `name` / `hash` this entry carries. In
- * summary mode the heavy payload never crosses the wire (nor is materialized).
+ * `WireTypeDef`. The heavy detail (`fields`, `meta_blocks`, `effective_fields`,
+ * `effective_meta`, `body`, `effective_body`, `source`, and the `abstract` /
+ * `required_meta` / `unmet_required_meta` batch) is dropped — the full `types`
+ * read or the single `type` read serves it, keyed by the `name` / `hash` this
+ * entry carries. In summary mode the heavy payload never crosses the wire (nor
+ * is materialized).
  */
 export interface WireTypeSummary {
   /** The repo the entry is reported from: the owner for the workspace read, the scoped repo for a per-repo read. */
@@ -832,7 +951,7 @@ export interface WireInstanceTypeCount {
    * The number of instance sites whose closure includes this type. CLOSURE-
    * INCLUSIVE: a site counts toward every type in its closure (claim + ancestors),
    * so this equals the length of the matching `instances_of` drill-in over the
-   * file/nested origins.
+   * SAME requested `origins`.
    */
   count: number
 }
@@ -850,12 +969,16 @@ export interface WireInstanceCountsView {
    */
   aborted_at_load: boolean
   /**
-   * Total AUTHORED instance SITES in scope — file-level instances and nested
-   * inline records — each counted once regardless of how broad its closure is.
-   * Type-def `meta` blocks are EXCLUDED (annotations, not browsable documents);
-   * engine-schema config-file instances (a repo's `.arsumbris/repo.yaml` is an
-   * `au.engine.repo`) DO count. Because `by_type` is closure-inclusive, the
-   * `by_type` counts do NOT sum to `total`.
+   * Total instance SITES in scope of the requested `origins`, each counted once
+   * regardless of how broad its closure is. The sites are exactly those the
+   * `origins` filter selects: file-level instances (`file`), nested inline
+   * records (`nested`), and type-def `meta` blocks (`meta`). Absent `origins`
+   * counts all three — so a no-arg total INCLUDES `meta` annotations, among them
+   * the always-present `au.engine.*` builtins; pass `origins: ['file']` /
+   * `['file', 'nested']` for a clean authored-document total. Engine-schema
+   * config-file instances (a repo's `.arsumbris/repo.yaml` is an `au.engine.repo`)
+   * count as `file` sites. Because `by_type` is closure-inclusive, the `by_type`
+   * counts do NOT sum to `total`.
    */
   total: number
   /** Per-type counts, identity-keyed, sorted by `(name, hash)`. */
@@ -1185,6 +1308,12 @@ export interface WireTypeIdentity {
 export interface WireClosureField extends WireField {
   /** The type-def that declares this field, owner-resolved. */
   origin: WireTypeIdentity
+  /**
+   * `true` when origins disagree on this field's shape. A divergent field is one
+   * entry PER ORIGIN, each with that origin's own `shape` / `required`, filled by
+   * an instance via its qualified key `field{origin}`. Key by `(name, origin)`.
+   */
+  divergent: boolean
 }
 
 /**
@@ -1203,12 +1332,12 @@ export interface WireTypeClosureEntry {
    */
   ancestors: WireTypeIdentity[]
   /**
-   * The effective field set: own fields plus every ancestor's, deduped by name
-   * and name-sorted. A field auto-unified across origins reports the lex-min one.
-   * A DIVERGENT field (origins disagreeing on shape) is now PRESENT too
-   * (**schema 28**), reporting its canonical lex-min origin here; its per-origin
-   * shapes live on the instance-level `effective_shape`. Previously such a field
-   * was excluded from this read.
+   * The effective field set: own fields plus every ancestor's, name-sorted. A
+   * field auto-unified across origins is one entry, the lex-min origin. A
+   * DIVERGENT field (origins disagreeing on shape) is one entry PER ORIGIN, each
+   * `divergent: true` with that origin's own `shape` / `required`, so a `name`
+   * can repeat: key by `(name, origin)`, never by `name` alone. The same
+   * projection as a type entry's `effective_fields`.
    */
   fields: WireClosureField[]
 }
@@ -1514,24 +1643,30 @@ export type WireValidateValueResult = WireValidateValueVerdict[]
  * runs, so a preview cannot disagree with what the write would land.
  */
 export interface WirePreviewTarget {
-  /** The resolved target path. */
+  /**
+   * The resolved target path. For `rename` the destination, where the moved file
+   * lands. For a folder op the FOLDER, at `to` for `move_dir`.
+   */
   path: string
   /**
    * The would-be content hash — doubles as the `expected_hash` a later real write
-   * can guard on. `null` for a `delete_file` (the file is gone).
+   * can guard on. `null` for a `delete_file` (the file is gone) and for a folder
+   * op (a folder has no content hash).
    */
   hash: string | null
   /**
    * The `(name, repo, hash)` identities the would-be file CLAIMS, each resolved in
    * the file's own repo. EMPTY for a plain note (no `type:`) and for a delete. The
    * pre-tool gate "is this a valid `X`" checks `identities` contains `X` AND
-   * `diagnostics` carry no error-severity finding.
+   * `diagnostics` carry no error-severity finding. EMPTY for a folder op.
    */
   identities: WireTypeIdentity[]
   /**
    * The would-be file's diagnostics — the same shape and codes as the
    * `diagnostics` read, WHOLE-file (body typing runs too, unlike
-   * `validate_value`'s frontmatter-only verdict).
+   * `validate_value`'s frontmatter-only verdict). For a folder op, every
+   * diagnostic on a file under the folder (the committing verb's scope); empty
+   * for `delete_dir`.
    */
   diagnostics: WireDiagnostic[]
 }
@@ -1539,28 +1674,96 @@ export interface WirePreviewTarget {
 /**
  * One `blast_radius` entry: another file whose diagnostics DIFFER from the current
  * knowledge base because of the previewed write (a delete's dangled referrers, a
- * type-def edit's broken dependents, a write's fixed referrers), and its would-be
- * diagnostics. Per-FILE only; a repo-level diagnostic change is not projected here.
+ * type-def edit's broken dependents, a write's fixed referrers, a rename's
+ * referrer whose re-spelled link turned ambiguous), and its would-be diagnostics.
+ * Per-FILE only; a repo-level diagnostic change is not projected here. A
+ * `rename`'s source and any file under a folder op's folder are never entries:
+ * they are the target.
  */
 export interface WirePreviewBlastEntry {
   path: string
   diagnostics: WireDiagnostic[]
 }
 
+/** One link a move re-spells: the link as it reads before and after. */
+export interface WireRewriteLink {
+  from: string
+  to: string
+}
+
+/**
+ * One referrer a `rename` / `move_dir` changes the bytes of, with each link it
+ * re-spells in source order. Only the ACTUAL would-change referrers: a bare
+ * `[[name]]` that still resolves after a name-keeping move is left
+ * byte-identical, so it is absent. A moved referrer (the renamed file's
+ * self-links, a file inside the moved folder) reports at its NEW path.
+ */
+export interface WireRewrite {
+  path: string
+  links: WireRewriteLink[]
+}
+
+/**
+ * One stranded link: `target` is the link as the referrer wrote it (fragments
+ * and `::repo` included), `to_file` the deleted file it resolved to, absolute.
+ */
+export interface WireStrandedLink {
+  target: string
+  to_file: string
+}
+
+/**
+ * One surviving file referencing a file a `delete_dir` removes. `path` is the
+ * referrer, absolute. A reference between two deleted files is absent.
+ */
+export interface WireStranded {
+  path: string
+  links: WireStrandedLink[]
+}
+
 /**
  * The built product of a `preview_mutation`: the target verdict plus the blast
- * radius. The other arm of `WirePreviewMutationResult` is a `{ reject }`.
+ * radius, and the op-specific move / delete reports. The other arm of
+ * `WirePreviewMutationResult` is a `{ reject }`. Each report is the list the
+ * committing verb's `result` would carry.
  */
 export interface WirePreviewProduct {
   target: WirePreviewTarget
   blast_radius: WirePreviewBlastEntry[]
+  /** The referrers the move rewrites, path-sorted. Present ONLY for `rename` / `move_dir`. */
+  rewrites?: WireRewrite[]
+  /** Every reference from a surviving file into the folder. Present ONLY for `delete_dir`. */
+  stranded?: WireStranded[]
+  /**
+   * The absolute paths the write would make outside git (a git-ignored,
+   * never-tracked file such as a `.DS_Store`), path-sorted, `[]` when none. Every
+   * op. Lets a consumer say "N files change without version control" up front.
+   */
+  untracked_files: string[]
+  /**
+   * The absolute directories the op would create, move, or remove that no commit
+   * records, path-sorted. Present ONLY for `move_dir` / `delete_dir`.
+   */
+  untracked_dirs?: string[]
+  /**
+   * The per-mixin outcome report, the same the committing write's response
+   * carries under `ensure_mixins`. Present ONLY when the op carried mixins
+   * (`write_file` / `edit_file` / `rename`). See `EnsureMixinOutcome`.
+   */
+  ensure_mixins?: EnsureMixinOutcome[]
 }
 
 /**
  * A structural reject arm of `preview_mutation`: the op refused before any product
  * existed (an edit or delete of an absent file, an absent or non-unique
- * `old_string`, a stamp on a non-list field, a path that mounts nowhere). A reject
- * is DATA on a SUCCESSFUL read, not an error frame.
+ * `old_string`, a stamp on a non-list field, a stamp or mixin on a type-def
+ * target, a mixin un-appliable under `ensure_mixins_strict`, a path that mounts
+ * nowhere). The message is the committing write's own. A
+ * `rename` / `move_dir` / `delete_dir` refuses exactly where the verb would, with
+ * the verb's own message (a consumed-member referrer's `detail` is the same
+ * `blocking_consumed_referrers`). The clean-at-HEAD precondition is about the
+ * write moment, so a preview does not check it. A reject is DATA on a SUCCESSFUL
+ * read, not an error frame.
  */
 export interface WirePreviewReject {
   reject: {
@@ -1577,9 +1780,9 @@ export interface WirePreviewReject {
  * result`: a `{ reject }` is a structural refusal, else it is a
  * `{ target, blast_radius }` built product.
  *
- * Additive (**schema stays 24**). v1 covers `write_file` / `edit_file` /
- * `delete_file` on PHYSICAL files; the structural refactors (rename / promote /
- * inline / rename_type) are not previewable yet.
+ * Covers `write_file` / `edit_file` / `delete_file` / `rename` / `move_dir` /
+ * `delete_dir`. The other structural refactors (promote / inline / rename_type)
+ * are not previewable.
  */
 export type WirePreviewMutationResult = WirePreviewProduct | WirePreviewReject
 
@@ -3129,6 +3332,81 @@ export interface WireMember extends WireMemberRole {
    * mounted, as before.
    */
   disabled: boolean
+  /**
+   * The resolution tier that FIRST located the member's root, the same value
+   * `au members` reports. A live tree is `entry` / `sibling` / `registry`, a
+   * snapshot `cache`, a `disabled:` member `disabled`. Never `unmounted`: an
+   * unmounted member is not a row here. Additive, no `schema_version` bump.
+   */
+  tier: WireMountedMemberTier
+}
+
+/**
+ * Which tier located a member, in the engine's resolution order. Closed set;
+ * consumers still tolerate unknown values per additive evolution.
+ * - `entry` — the entry directory itself.
+ * - `sibling` — a co-present repo, beside the entry or nested under a member.
+ * - `registry` — the per-user `repos.yaml` path.
+ * - `cache` — a package-cache snapshot at its locked sha.
+ * - `unmounted` — no tier located it, or its root could not be mounted.
+ * - `disabled` — switched off by the workspace's `disabled:` overlay.
+ *
+ * Only `unmounted` wants a locate.
+ */
+export type WireMemberTier = 'entry' | 'sibling' | 'registry' | 'cache' | 'unmounted' | 'disabled'
+
+/** The tiers a `members` read row can carry: every tier but `unmounted`. */
+export type WireMountedMemberTier = Exclude<WireMemberTier, 'unmounted'>
+
+/**
+ * One member of the daemon-less `au members --json` answer.
+ * WIRE.md §Daemon-less member resolution.
+ */
+export interface WireAuMembersMember {
+  /** The declared name. */
+  name: string
+  /** A disabled member carries its declared `edit` / `discover` role. */
+  role: WireMemberRoleName
+  tier: WireMemberTier
+  /** The resolved root. Absent when no tier located it (`unmounted`). */
+  path?: string
+  /**
+   * The member-outcome diagnostic code, a key into the output's `diagnostics`.
+   * Absent for a cleanly mounted member.
+   * - unmounted: the role-keyed `*-member-unmounted` / `peer-unmounted`, or the
+   *   clash that left it unmounted (which takes precedence).
+   * - mounted: only `edit-member-read-only`, an editable member from the cache.
+   */
+  code?: string
+}
+
+/**
+ * The stdout of `au members <entry> --json`, a CLI command, not a socket frame.
+ * A launcher's pre-start check: which declared members would mount, and
+ * through which tier. It runs the build's own composition, so it answers
+ * exactly what `au daemon start` mounts. See `runAuMembers` for the node
+ * helper that runs it. WIRE.md §Daemon-less member resolution.
+ */
+export interface WireAuMembersOutput {
+  /** The wire's `SCHEMA_VERSION`, checked as the daemon's is. */
+  schema_version: number
+  /** The canonical entry directory. */
+  entry: string
+  /**
+   * False when a locked transitive dependency's snapshot is absent from the
+   * package cache, so it is missing from `members`. `resolve` completes it.
+   */
+  complete: boolean
+  /** The `dependency-cache-miss` diagnostics behind `complete: false`. Empty when complete. */
+  incomplete: WireDiagnostic[]
+  /** Every declared member, name-sorted, unmounted ones included. */
+  members: WireAuMembersMember[]
+  /**
+   * The workspace-level diagnostics the build emits for this composition. The
+   * authoritative list; each member's `code` is a key into it. Spans carry no
+   * `line_col`, and `span.file` is absolute.
+   */
+  diagnostics: WireDiagnostic[]
 }
 
 /**
@@ -3469,6 +3747,15 @@ export type WireIgnoresResult = WireIgnoresMember[]
  *   token for the link and `field-value` tokens for the surrounding text runs,
  *   so one string value can decode to several interleaved tokens.
  * - `type-claim` — a `type:` reference to a type-def, one per claimed name.
+ *   `name` is the AUTHORED form (bare or `::repo`-qualified). `resolved` is the
+ *   identity the claim resolves to, the same `TypeId` validation resolves it
+ *   to: `resolved.name` the type name alone, `resolved.repo` the owner the
+ *   claim NAMES (its `::repo`, else the claiming file's repo), `resolved.hash`
+ *   the closure hash. So `(resolved.name, resolved.hash)` joins onto an
+ *   identity-keyed read (an `instance_counts` `by_type` row) directly. ABSENT
+ *   when the claim does not resolve (an unknown type, an unmounted peer); omit
+ *   rather than guess. Carried on every `type-claim` token (instance, inline
+ *   record, typed fence, `extends:` parent, `meta:` `type:`).
  * - `typed-block` — an inline `[:field]` fence; a container whose inner scalars
  *   ride their own `field-value` tokens (the one nesting).
  * - `block-id` — an addressable id (`^id` marker, trailing fence id, or `^:` record id).
@@ -3478,9 +3765,9 @@ export type WireIgnoresResult = WireIgnoresMember[]
  * - `field-shape` — a field's declared shape, a CONTAINER spanning the whole
  *   shape expression; `field` plus `value_type` (a `WireShape`, or null when the
  *   shape failed to parse). Encloses the leaf kinds below. A quoted shape (e.g.
- *   `r: "decision*"`) emits this container but NOT its leaves — the normalized
- *   scalar's offsets don't map onto the source, so the per-name leaves are
- *   dropped rather than mis-placed (never a wrong span).
+ *   `r: "decision*"`) carries its per-name leaves too, source-aligned like an
+ *   unquoted shape — the parse layer aligns each leaf to the source scalar, so
+ *   quoting no longer drops them.
  * - `type-ref` — a navigable type-def name (`name`): a field-shape name
  *   (record / reference / inline base, compound operand, def-ref bound) or a
  *   `sealed:` branch. Broken-ness rides the diagnostics read, never a token flag.
@@ -3504,7 +3791,7 @@ export type WireSemanticToken =
   | { kind: 'wikilink-broken'; range: WireSpan; target: string; repo?: string }
   | { kind: 'wikilink-pinned'; range: WireSpan; target: string; repo?: string; commit: string }
   | { kind: 'field-value'; range: WireSpan; field: string; value_type: WireShape }
-  | { kind: 'type-claim'; range: WireSpan; name: string }
+  | { kind: 'type-claim'; range: WireSpan; name: string; resolved?: WireTypeIdentity }
   | { kind: 'typed-block'; range: WireSpan; field: string }
   | { kind: 'block-id'; range: WireSpan; id: string }
   | { kind: 'anchor'; range: WireSpan; text: string }

@@ -1,6 +1,10 @@
 // DaemonClient mutate helpers (write_file / edit_file / assign_block_id /
 // edit_record / append_record / delete_file / promote / inline /
-// rename_block_id / rename / rename_type) against a bare Unix socket.
+// rename_block_id / rename / move_dir / delete_dir / rename_type / set_ignores /
+// set_config, and the COMPOSITION-sort verbs add_dep / remove_dep /
+// add_workspace_member / remove_workspace_member / set_workspace_member_role /
+// set_workspace_member_disabled)
+// against a bare Unix socket.
 // A stand-in server reads the id the client assigns and replies with each shape
 // a mutate can answer — a successful `response` (the read-response envelope), a
 // not-ready `response`, and an `error` (carrying `detail`) — proving the client
@@ -463,6 +467,72 @@ describe('DaemonClient mutate helpers', () => {
     client.close()
   })
 
+  it('moveDir sends the move_dir verb with path/to and no riders', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.moveDir('content/drafts', 'content/archive/drafts')
+    const req = await request
+    expect(req['mutate']).toBe('move_dir')
+    expect(req['path']).toBe('content/drafts')
+    expect(req['to']).toBe('content/archive/drafts')
+    for (const rider of ['stamps', 'ensure_mixins', 'attribution']) expect(req[rider]).toBeUndefined()
+    sock.write(
+      encodeFrame({
+        type: 'response',
+        schema_version: 29,
+        ready: true,
+        version: 12,
+        result: {
+          path: 'content/archive/drafts',
+          hash: null,
+          diagnostics: [],
+          reflected: true,
+          commit: 'c',
+          commits: { vault: 'c' },
+          untracked_files: [],
+          rewrites: [{ path: '/v/content/index.md', links: [{ from: '[[drafts/a]]', to: '[[archive/drafts/a]]' }] }],
+          untracked_dirs: [],
+        },
+        id: req['id'],
+      }),
+    )
+    const out = await p
+    expect('result' in out && out.result.rewrites?.[0]?.links[0]?.to).toBe('[[archive/drafts/a]]')
+    client.close()
+  })
+
+  it('deleteDir sends the delete_dir verb with path only', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.deleteDir('content/drafts')
+    const req = await request
+    expect(req['mutate']).toBe('delete_dir')
+    expect(req['path']).toBe('content/drafts')
+    expect(req['to']).toBeUndefined()
+    sock.write(
+      encodeFrame({
+        type: 'response',
+        schema_version: 29,
+        ready: true,
+        version: 12,
+        result: {
+          path: 'content/drafts',
+          hash: null,
+          diagnostics: [],
+          reflected: true,
+          commit: 'c',
+          commits: { vault: 'c' },
+          untracked_files: [],
+          stranded: [{ path: '/v/content/index.md', links: [{ target: '[[drafts/a]]', to_file: '/v/content/drafts/a.md' }] }],
+          untracked_dirs: [],
+          last_live_commit: 'p',
+        },
+        id: req['id'],
+      }),
+    )
+    const out = await p
+    expect('result' in out && out.result.stranded?.[0]?.links[0]?.to_file).toBe('/v/content/drafts/a.md')
+    client.close()
+  })
+
   it('writeFile carries the stamps rider, matchOn -> snake_case match_on', async () => {
     const { client, sock, request } = await connectAndCapture()
     const p = client.writeFile('content/a.md', 'hello', {
@@ -820,6 +890,155 @@ describe('DaemonClient mutate helpers', () => {
       }),
     )
     expect(await p).toEqual({ ok: false, error: "'/v/not-a-member' is not a declared member root" })
+
+    // The connection survives the in-band reject: a follow-up read still settles.
+    const readP = client.read({ read: 'ready' })
+    const next = await new Promise<Record<string, unknown>>((resolve) => {
+      const decoder = new FrameDecoder()
+      sock.on('data', (chunk: Buffer) => {
+        for (const f of decoder.push(chunk)) resolve(f as Record<string, unknown>)
+      })
+    })
+    sock.write(
+      encodeFrame({ type: 'response', schema_version: 29, ready: true, version: 1, result: {}, id: next['id'] }),
+    )
+    expect((await readP).ready).toBe(true)
+    client.close()
+  })
+
+  // The five COMPOSITION-sort verbs, each authoring an editable member's
+  // `.arsumbris/repo.yaml` or `.arsumbris/workspace.yaml` and riding the standard
+  // mutation frame. The tests prove the camelCase edge builds the snake_case wire
+  // args and that a success settles the standard envelope.
+
+  /** Reply to `req` with a standard success envelope, then await `p`. */
+  async function replyStandard(
+    sock: net.Socket,
+    req: Record<string, unknown>,
+    p: Promise<unknown>,
+  ): Promise<void> {
+    sock.write(
+      encodeFrame({
+        type: 'response',
+        schema_version: 29,
+        ready: true,
+        version: 42,
+        result: { path: '/v/app/.arsumbris/repo.yaml', hash: 'h1', diagnostics: [], reflected: true, commit: 'c1', commits: {} },
+        id: req['id'],
+      }),
+    )
+    await p
+  }
+
+  it('addRepoDependency sends add_dep with remote/ref/root/expected_hash snake_case args', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.addRepoDependency('au-base-types', {
+      remote: 'git@example.com:au-base-types.git',
+      ref: 'main',
+      root: '/v/app',
+      expectedHash: 'abc123',
+    })
+    const req = await request
+    expect(req['mutate']).toBe('add_dep')
+    expect(req['name']).toBe('au-base-types')
+    expect(req['remote']).toBe('git@example.com:au-base-types.git')
+    expect(req['ref']).toBe('main')
+    expect(req['root']).toBe('/v/app')
+    expect(req['expected_hash']).toBe('abc123')
+    await replyStandard(sock, req, p)
+    client.close()
+  })
+
+  it('addRepoDependency omits absent optionals (a bare name carries no remote/ref/root/expected_hash)', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.addRepoDependency('au-base-types')
+    const req = await request
+    expect(req['mutate']).toBe('add_dep')
+    expect(req['name']).toBe('au-base-types')
+    expect('remote' in req).toBe(false)
+    expect('ref' in req).toBe(false)
+    expect('root' in req).toBe(false)
+    expect('expected_hash' in req).toBe(false)
+    await replyStandard(sock, req, p)
+    client.close()
+  })
+
+  it('removeRepoDependency sends remove_dep with name and optional root/expected_hash', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.removeRepoDependency('au-base-types', { root: '/v/app', expectedHash: 'h0' })
+    const req = await request
+    expect(req['mutate']).toBe('remove_dep')
+    expect(req['name']).toBe('au-base-types')
+    expect(req['root']).toBe('/v/app')
+    expect(req['expected_hash']).toBe('h0')
+    await replyStandard(sock, req, p)
+    client.close()
+  })
+
+  it('addWorkspaceMember sends add_workspace_member with name/role and optional root', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.addWorkspaceMember('au-govern', 'discover', { root: '/v/app' })
+    const req = await request
+    expect(req['mutate']).toBe('add_workspace_member')
+    expect(req['name']).toBe('au-govern')
+    expect(req['role']).toBe('discover')
+    expect(req['root']).toBe('/v/app')
+    expect('expected_hash' in req).toBe(false)
+    await replyStandard(sock, req, p)
+    client.close()
+  })
+
+  it('removeWorkspaceMember sends remove_workspace_member with name and no role', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.removeWorkspaceMember('au-govern')
+    const req = await request
+    expect(req['mutate']).toBe('remove_workspace_member')
+    expect(req['name']).toBe('au-govern')
+    expect('role' in req).toBe(false)
+    await replyStandard(sock, req, p)
+    client.close()
+  })
+
+  it('setWorkspaceMemberRole sends set_workspace_member_role with the TARGET role', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.setWorkspaceMemberRole('au-govern', 'edit', { expectedHash: 'h2' })
+    const req = await request
+    expect(req['mutate']).toBe('set_workspace_member_role')
+    expect(req['name']).toBe('au-govern')
+    expect(req['role']).toBe('edit')
+    expect(req['expected_hash']).toBe('h2')
+    await replyStandard(sock, req, p)
+    client.close()
+  })
+
+  it('setWorkspaceMemberDisabled sends set_workspace_member_disabled with the boolean and root', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.setWorkspaceMemberDisabled('au-govern', false, { root: '/ws/entry', expectedHash: 'h3' })
+    const req = await request
+    expect(req['mutate']).toBe('set_workspace_member_disabled')
+    expect(req['name']).toBe('au-govern')
+    expect(req['disabled']).toBe(false)
+    expect(req['root']).toBe('/ws/entry')
+    expect(req['expected_hash']).toBe('h3')
+    expect('role' in req).toBe(false)
+    await replyStandard(sock, req, p)
+    client.close()
+  })
+
+  it('addRepoDependency resolves { ok: false } with detail on a duplicate-name reject, connection surviving', async () => {
+    const { client, sock, request } = await connectAndCapture()
+    const p = client.addRepoDependency('au-base-types')
+    const req = await request
+    sock.write(
+      encodeFrame({
+        type: 'error',
+        schema_version: 29,
+        error: "duplicate dep 'au-base-types'",
+        detail: { current_hash: 'h9' },
+        id: req['id'],
+      }),
+    )
+    expect(await p).toEqual({ ok: false, error: "duplicate dep 'au-base-types'", detail: { current_hash: 'h9' } })
 
     // The connection survives the in-band reject: a follow-up read still settles.
     const readP = client.read({ read: 'ready' })

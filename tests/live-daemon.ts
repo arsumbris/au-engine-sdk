@@ -8,7 +8,7 @@
 // collide with a daemon already serving the shared one (or with each other),
 // and file mutations stay harmless.
 
-import { type ChildProcess, spawn } from 'node:child_process'
+import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -69,9 +69,20 @@ export function copyTestEntry(): string {
   return entry
 }
 
-/** Copy the test entry repo, spawn a daemon over it, connect, wait for ready. */
-export async function startLiveDaemon(): Promise<LiveDaemon> {
+/**
+ * Copy the test entry repo, spawn a daemon over it, connect, wait for ready.
+ * `git: true` makes the copy a fresh git working tree with everything committed,
+ * for the verbs (and their previews) that require one: the folder verbs and a
+ * `rename`, whose saga compensation is git-only.
+ */
+export async function startLiveDaemon(options: { git?: boolean } = {}): Promise<LiveDaemon> {
   const entry = copyTestEntry()
+  if (options.git) {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: entry, stdio: 'ignore' })
+    git('init', '-q')
+    git('add', '-A')
+    git('-c', 'user.name=smoke', '-c', 'user.email=smoke@test', 'commit', '-q', '-m', 'smoke fixture')
+  }
   const daemon: ChildProcess = spawn(AU_BIN, ['daemon', 'start', entry], { stdio: 'ignore' })
   await waitForReady(entry, 15_000)
   const client = await DaemonClient.connect(entry)

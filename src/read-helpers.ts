@@ -11,6 +11,7 @@
 import { WireError } from './wire.ts'
 import type { EngineReadResult, ReadRequest, ResponseFrame } from './wire.ts'
 import { toWireStamps, type Stamp } from './stamps.ts'
+import { toWireEnsureMixins } from './ensure-mixins.ts'
 import type {
   WireReferencesInResult,
   WireAnchorsResult,
@@ -42,6 +43,7 @@ import type {
   WireTypeGraphArgs,
   WireTypeGraphResult,
   WireInstanceCountsResult,
+  WireInstanceOrigin,
   WireInstancesOfArgs,
   WireInstancesOfResult,
   WireInstancesResult,
@@ -258,17 +260,33 @@ export function readTypeCounts(
  * `(name, hash)`): a consumer joins a count onto a `types` summary row by
  * `(name, hash)`. It is CLOSURE-INCLUSIVE — a site counts toward every type in
  * its closure (claim + ancestors), so a `count` equals the length of the
- * matching `readInstancesOf` drill-in and the counts do NOT sum to `total`.
+ * matching `readInstancesOf` drill-in over the SAME `origins` and the counts do
+ * NOT sum to `total`.
+ *
+ * `origins` is an include-set filter over the site kinds counted, the SAME
+ * vocabulary and semantics as `readInstancesOf`'s `origins` — so this read is
+ * the true count-dual of that list. Absent `origins` counts ALL THREE
+ * (`file` + `nested` + `meta`), identical to `readInstancesOf`'s no-arg set, so
+ * the two duals default the same way. A present list narrows the tally:
+ * `origins: ['file']` yields the file-only count that matches a file-only
+ * `readInstancesOf(type, { origins: ['file'] })` drill-in — the cheap way to
+ * render an "N instances" label without fetching the rows.
+ *
+ * NOTE the default counts meta sites: a no-arg count includes type-def `meta`
+ * blocks (annotations, including the always-present `au.engine.*` builtins), so
+ * pass `origins: ['file', 'nested']` for the clean authored-document overview.
  */
 export function readInstanceCounts(
   reader: WireReader,
   repo?: string,
   scope?: WireTypeScope,
+  origins?: WireInstanceOrigin[],
 ): Promise<TypedRead<WireInstanceCountsResult>> {
   return issueRead(reader, {
     read: 'instance_counts',
     ...(repo !== undefined && { repo }),
     ...(scope !== undefined && { scope }),
+    ...(origins !== undefined && { origins }),
   })
 }
 
@@ -411,16 +429,28 @@ export function readValidateValue(
 }
 
 /**
- * The op a `preview_mutation` simulates, discriminated by `op`. Mirrors the v1
- * deterministic mutation catalog (`write_file` / `edit_file` / `delete_file`),
- * reusing their argument shapes so a consumer previews the exact call it would
- * then mutate with. Consumer-facing camelCase; `readPreviewMutation` normalizes
- * to the wire (`oldString` → `old_string`, `replaceAll` → `replace_all`, and
- * `stamps` folded via `toWireStamps`). NO `expectedHash`: a concurrency guard is
- * about the write moment, not the product.
+ * The op a `preview_mutation` simulates, discriminated by `op`. Mirrors the
+ * deterministic mutation catalog (`write_file` / `edit_file` / `delete_file` /
+ * `rename` / `move_dir` / `delete_dir`), reusing their argument shapes so a
+ * consumer previews the exact call it would then mutate with. Consumer-facing
+ * camelCase; `readPreviewMutation` normalizes to the wire (`oldString` →
+ * `old_string`, `replaceAll` → `replace_all`, and `stamps` folded via
+ * `toWireStamps`, `ensureMixins` / `ensureMixinsStrict` via
+ * `toWireEnsureMixins`). NO `expectedHash`: a concurrency guard is about the
+ * write moment, not the product. `write_file` / `edit_file` / `rename` take the
+ * `ensureMixins` rider as the mutation does: the mixins fold after the stamps,
+ * through the write's own decision, so the previewed bytes equal the written
+ * ones (for `rename`, into the moved file).
  */
 export type PreviewMutationOp =
-  | { op: 'write_file'; path: string; content: string; stamps?: Stamp[] }
+  | {
+      op: 'write_file'
+      path: string
+      content: string
+      stamps?: Stamp[]
+      ensureMixins?: string[]
+      ensureMixinsStrict?: boolean
+    }
   | {
       op: 'edit_file'
       path: string
@@ -428,8 +458,20 @@ export type PreviewMutationOp =
       newString: string
       replaceAll?: boolean
       stamps?: Stamp[]
+      ensureMixins?: string[]
+      ensureMixinsStrict?: boolean
     }
   | { op: 'delete_file'; path: string }
+  | {
+      op: 'rename'
+      path: string
+      to: string
+      stamps?: Stamp[]
+      ensureMixins?: string[]
+      ensureMixinsStrict?: boolean
+    }
+  | { op: 'move_dir'; path: string; to: string }
+  | { op: 'delete_dir'; path: string }
 
 /**
  * Dry-run a deterministic mutation and read its product WITHOUT committing: the
@@ -442,13 +484,26 @@ export type PreviewMutationOp =
  *
  * The result is a `WirePreviewMutationResult` — DISCRIMINATE with `'reject' in
  * result`: a `{ reject }` is a structural refusal (an edit/delete of an absent
- * file, an absent or non-unique `oldString`, a stamp on a non-list field, a path
- * that mounts nowhere), returned as DATA on a successful read, not an error frame.
- * Otherwise a `{ target, blast_radius }` built product. `target.identities` is
- * EMPTY for a plain note and for a delete; `target.hash` is `null` for a delete.
+ * file, an absent or non-unique `oldString`, a stamp on a non-list field, a stamp
+ * or mixin on a type-def target, a mixin un-appliable under `ensureMixinsStrict`,
+ * a path that mounts nowhere), returned as DATA on a successful read, not an
+ * error frame. The reject message is the committing write's own.
+ * Otherwise a `{ target, blast_radius, ... }` built product. `target.identities`
+ * is EMPTY for a plain note, a delete, and a folder op; `target.hash` is `null`
+ * for a delete and a folder op.
  *
- * Additive (**schema stays 24**). v1 is physical files only; the structural
- * refactors are not previewable yet.
+ * The move and folder ops add their blast report: `rewrites` (`rename` /
+ * `move_dir`, the referrers whose bytes the move ACTUALLY changes — a bare
+ * `[[name]]` a name-keeping move leaves identical is absent), `stranded`
+ * (`delete_dir`, every reference from a surviving file into the folder), and
+ * `untracked_dirs` (folder ops). `untracked_files` is on every product. A
+ * `rename` / `move_dir` / `delete_dir` preview rejects exactly where the verb
+ * would, with its message, bar the write-moment clean-at-HEAD check.
+ *
+ * An op carrying `ensureMixins` adds `ensure_mixins`, the per-mixin outcome
+ * report the committing write's response carries, so a lenient skip shows
+ * before the write. `target.identities` / `target.diagnostics` reflect the
+ * mixin-changed `type:` claim.
  */
 export function readPreviewMutation(
   reader: WireReader,
@@ -456,7 +511,14 @@ export function readPreviewMutation(
 ): Promise<TypedRead<WirePreviewMutationResult>> {
   const request: ReadRequest =
     op.op === 'write_file'
-      ? { read: 'preview_mutation', op: 'write_file', path: op.path, content: op.content, ...toWireStamps(op.stamps) }
+      ? {
+          read: 'preview_mutation',
+          op: 'write_file',
+          path: op.path,
+          content: op.content,
+          ...toWireStamps(op.stamps),
+          ...toWireEnsureMixins(op.ensureMixins, op.ensureMixinsStrict),
+        }
       : op.op === 'edit_file'
         ? {
             read: 'preview_mutation',
@@ -466,8 +528,20 @@ export function readPreviewMutation(
             new_string: op.newString,
             ...(op.replaceAll !== undefined && { replace_all: op.replaceAll }),
             ...toWireStamps(op.stamps),
+            ...toWireEnsureMixins(op.ensureMixins, op.ensureMixinsStrict),
           }
-        : { read: 'preview_mutation', op: 'delete_file', path: op.path }
+        : op.op === 'rename'
+          ? {
+              read: 'preview_mutation',
+              op: 'rename',
+              path: op.path,
+              to: op.to,
+              ...toWireStamps(op.stamps),
+              ...toWireEnsureMixins(op.ensureMixins, op.ensureMixinsStrict),
+            }
+          : op.op === 'move_dir'
+            ? { read: 'preview_mutation', op: 'move_dir', path: op.path, to: op.to }
+            : { read: 'preview_mutation', op: op.op, path: op.path }
   return issueRead(reader, request)
 }
 
@@ -481,8 +555,9 @@ export function readPreviewMutation(
  * a qualifier scopes to the 0-or-1 that repo owns. An unknown name is an EMPTY
  * array (never null or an error). Each entry carries `identity`, `ancestors`
  * (self first, owner-resolved), and `fields` (effective set, each with its
- * declaring `origin`) — one read replaces the client-side closure / field-origin
- * walks, and it is the same walk the validator runs.
+ * declaring `origin` and `divergent` flag; key by `(name, origin)`). One read
+ * replaces the client-side closure / field-origin walks, and it is the same
+ * walk the validator runs.
  *
  * FLAG: a consumer expecting a single object will read `[0]`-shaped data wrong.
  */

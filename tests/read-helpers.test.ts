@@ -245,7 +245,7 @@ describe('cross-repo read request shapes', () => {
     expect(r2.last).toEqual({ read: 'type_counts', repo: 'base' })
   })
 
-  it('readInstanceCounts issues instance_counts, with optional repo and scope', async () => {
+  it('readInstanceCounts issues instance_counts, with optional repo, scope and origins', async () => {
     const view = { aborted_at_load: false, total: 0, by_type: [] }
 
     const r1 = frameReader({ ready: true, version: 1, result: view })
@@ -263,6 +263,20 @@ describe('cross-repo read request shapes', () => {
     const r4 = frameReader({ ready: true, version: 1, result: view })
     await readInstanceCounts(r4, 'base', 'all')
     expect(r4.last).toEqual({ read: 'instance_counts', repo: 'base', scope: 'all' })
+
+    // origins alone: the file-only count-dual of a file-only instances_of drill-in.
+    const r5 = frameReader({ ready: true, version: 1, result: view })
+    await readInstanceCounts(r5, undefined, undefined, ['file'])
+    expect(r5.last).toEqual({ read: 'instance_counts', origins: ['file'] })
+
+    const r6 = frameReader({ ready: true, version: 1, result: view })
+    await readInstanceCounts(r6, 'base', 'all', ['file', 'nested'])
+    expect(r6.last).toEqual({
+      read: 'instance_counts',
+      repo: 'base',
+      scope: 'all',
+      origins: ['file', 'nested'],
+    })
   })
 
   it('readTypeBatch issues the type read with the names selector, not name', async () => {

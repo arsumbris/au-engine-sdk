@@ -234,6 +234,36 @@ describe.skipIf(!binaryPresent)('typed read helpers against the live daemon', ()
     expect('unmet_required_meta' in (w as object)).toBe(false)
   })
 
+  it('readType: effective_fields / effective_meta, the inherited resolved view', async () => {
+    // `widget.bare` declares no own fields; `label` is inherited from `widget`.
+    const bare = ready(await readType(live.client, 'widget.bare'))
+    expect(bare?.fields).toEqual([])
+    const label = bare?.effective_fields.find((f) => f.name === 'label')
+    expect(label?.origin.name).toBe('widget')
+    expect(label?.divergent).toBe(false)
+    expect(bare?.effective_meta).toEqual([])
+
+    // `widget.full`'s own `display-meta` block surfaces keyed by meta identity,
+    // with `from` naming the declaring def.
+    const full = ready(await readType(live.client, 'widget.full'))
+    const display = full?.effective_meta.find((m) => m.meta_type.name === 'display-meta')
+    expect(display?.meta_type.hash).not.toBe('')
+    expect(display?.meta_type.type_owners.length).toBeGreaterThan(0)
+    expect(display?.blocks).toHaveLength(1)
+    expect(display?.blocks[0]?.from.name).toBe('widget.full')
+    expect(display?.blocks[0]?.from.hash).toBe(full?.hash)
+
+    // `type_closure` fields carry the same `divergent` flag.
+    const [closure] = ready(await readTypeClosure(live.client, 'widget.full'))
+    expect(closure?.fields.find((f) => f.name === 'label')?.divergent).toBe(false)
+
+    // The summary projection omits both.
+    const summary = ready(await readTypes(live.client, { summary: true, scope: 'own' }))
+    const w = summary.find((t) => t.name === 'widget.full')
+    expect('effective_fields' in (w as object)).toBe(false)
+    expect('effective_meta' in (w as object)).toBe(false)
+  })
+
   it('readInstancesOf: match records with frontmatter fields', async () => {
     const people = ready(await readInstancesOf(live.client, 'person'))
     const alice = people.find((p) => p.path.endsWith('alice.md'))
@@ -596,11 +626,13 @@ describe.skipIf(!binaryPresent)('typed read helpers against the live daemon', ()
     expect(root?.editable).toBe(true)
     expect(root?.local).toBe(true)
     expect(root?.role).toBe('entry')
-    // every member carries the three axes with the right types.
+    expect(root?.tier).toBe('entry')
+    // every member carries the three axes with the right types, and a mounted tier.
     for (const m of members) {
       expect(typeof m.editable).toBe('boolean')
       expect(typeof m.local).toBe('boolean')
       expect(['entry', 'edit', 'discover', 'dep']).toContain(m.role)
+      expect(['entry', 'sibling', 'registry', 'cache', 'disabled']).toContain(m.tier)
     }
     // name-sorted, stable across reads.
     const names = members.map((m) => m.repo)
@@ -850,6 +882,66 @@ describe.skipIf(!binaryPresent)('typed read helpers against the live daemon', ()
     // the delete still stands (dry run): alice.md is present.
     const listed = ready(await readFiles(live.client))
     expect(listed.some((f) => f.path.includes('content/alice.md'))).toBe(true)
+  })
+
+  it('readPreviewMutation write_file + ensureMixins: the mixin folds into the claim and reports its outcome', async () => {
+    const result = ready(
+      await readPreviewMutation(live.client, {
+        op: 'write_file',
+        path: 'content/preview-mixin-note.md',
+        // claimless, but carries quality's required `gate`, so the mixin applies cleanly.
+        content: '---\ngate: stub\n---\na plain note, the mixin creates the claim\n',
+        ensureMixins: ['quality::test-vault'],
+      }),
+    )
+    if ('reject' in result) throw new Error(`unexpected reject: ${result.reject.message}`)
+    expect(result.ensure_mixins).toEqual([{ mixin: 'quality::test-vault', outcome: 'applied' }])
+    // the created `type: quality` claim resolves, so the preview shows it.
+    expect(result.target.identities.map((i) => i.name)).toContain('quality')
+    const listed = ready(await readFiles(live.client))
+    expect(listed.some((f) => f.path.includes('preview-mixin-note.md'))).toBe(false)
+  })
+
+  it('readPreviewMutation edit_file + ensureMixins: an already-claimed mixin is a no_op', async () => {
+    const result = ready(
+      await readPreviewMutation(live.client, {
+        op: 'edit_file',
+        path: 'content/alice.md',
+        oldString: 'role: "Founder"',
+        newString: 'role: "Co-Founder"',
+        ensureMixins: ['quality::test-vault'],
+      }),
+    )
+    if ('reject' in result) throw new Error(`unexpected reject: ${result.reject.message}`)
+    expect(result.ensure_mixins).toEqual([{ mixin: 'quality::test-vault', outcome: 'no_op' }])
+  })
+
+  it('readPreviewMutation ensureMixins: un-appliable rejects under strict, skips when lenient', async () => {
+    const op = {
+      op: 'write_file' as const,
+      path: 'content/preview-bad-mixin.md',
+      content: 'a plain note\n',
+      ensureMixins: ['nope::nowhere'],
+    }
+    const strict = ready(await readPreviewMutation(live.client, op))
+    expect('reject' in strict).toBe(true)
+    const lenient = ready(await readPreviewMutation(live.client, { ...op, ensureMixinsStrict: false }))
+    if ('reject' in lenient) throw new Error(`unexpected reject: ${lenient.reject.message}`)
+    expect(lenient.ensure_mixins?.[0]?.mixin).toBe('nope::nowhere')
+    expect(lenient.ensure_mixins?.[0]?.outcome).toBe('skipped')
+    expect(typeof lenient.ensure_mixins?.[0]?.reason).toBe('string')
+  })
+
+  it('readPreviewMutation: an op without mixins carries no ensure_mixins report', async () => {
+    const result = ready(
+      await readPreviewMutation(live.client, {
+        op: 'write_file',
+        path: 'content/preview-no-mixin.md',
+        content: 'a plain note\n',
+      }),
+    )
+    if ('reject' in result) throw new Error(`unexpected reject: ${result.reject.message}`)
+    expect(result.ensure_mixins).toBeUndefined()
   })
 
   it('readPreviewMutation: a structural refusal is a { reject }, DATA on a successful read', async () => {

@@ -241,6 +241,48 @@ export interface SetConfigOptions {
 }
 
 /**
+ * The `edit:` (read-write) vs `discover:` (read-only) list a workspace member
+ * sits in, the `role` arg of `addWorkspaceMember` / `setWorkspaceMemberRole`.
+ * For `setWorkspaceMemberRole` it is the TARGET list to move the member into.
+ */
+export type WorkspaceRole = 'edit' | 'discover'
+
+/**
+ * Shared optional args of the COMPOSITION-sort mutation verbs
+ * (`addRepoDependency` / `removeRepoDependency` / `addWorkspaceMember` /
+ * `removeWorkspaceMember` / `setWorkspaceMemberRole` /
+ * `setWorkspaceMemberDisabled`), each authoring an editable member's
+ * `.arsumbris/repo.yaml` or `.arsumbris/workspace.yaml`.
+ */
+export interface CompositionMutateOptions {
+  /**
+   * The editable member root whose `.arsumbris/` file to author. Matched by
+   * canonical path, so any spelling canonicalizing to a member root resolves
+   * (a symlinked temp dir included). Absent means the served entry, the repo
+   * the daemon was started on, never a sibling at the same depth.
+   */
+  root?: string
+  /**
+   * The read-before-write guard: an optional compare-and-set against the
+   * current file's content hash (a prior mutate's `hash`). A mismatch rejects
+   * without writing. Absent means author-regardless.
+   */
+  expectedHash?: string
+}
+
+/**
+ * Options for `addRepoDependency` — the shared composition args plus the new
+ * `deps:` entry's optional `remote` / `ref`, both authored verbatim into
+ * `<member>/.arsumbris/repo.yaml`.
+ */
+export interface AddRepoDependencyOptions extends CompositionMutateOptions {
+  /** The dependency's optional git remote, recorded on its `deps:` entry. */
+  remote?: string
+  /** The dependency's optional git ref (branch / tag / sha), recorded on its `deps:` entry. */
+  ref?: string
+}
+
+/**
  * The daemon's socket file name for an entry, `<hash>.sock`, mirroring
  * `au_engine::socket_file_name` (`serve.rs`). `<hash>` is the FNV-1a-64 of the
  * entry path's bytes, 16 lowercase zero-padded hex digits — the same algorithm
@@ -894,6 +936,48 @@ export class DaemonClient {
   }
 
   /**
+   * Issue a `mutate: move_dir` — move or rename the folder `path` to `to` as ONE
+   * saga: every file the engine catalogues under it moves to the same relative
+   * path under `to`, the directory skeleton (empty directories included) follows,
+   * one commit per git working tree touched. `rename`'s rule applied to every
+   * moved file: a PATH-addressed referrer is re-pointed, a bare `[[name]]` still
+   * resolves and is left byte-identical, a commit-pinned one is frozen. Any
+   * failure rolls every member back; the folder is fully moved or untouched.
+   *
+   * No riders (stamps, mixins, attribution): a folder has no single file to target.
+   * Rejects, naming the offending paths, on on-disk content the engine does not
+   * catalogue (an `.auignore`d path, a nested `.git` or repo, a symlink), a stale
+   * engine view, a taken / self-nested / cross-repo `to`, a dirty file, and a
+   * folder holding files that no git working tree covers (an empty folder moves
+   * anywhere). The success `result` has `path` = `to`, `hash: null`, the folder's
+   * `diagnostics`, plus `rewrites` and `untracked_dirs`. Preview first with
+   * `readPreviewMutation({ op: 'move_dir', ... })`. Resolves a typed outcome (see
+   * `TypedMutate`); rejects only on transport failure.
+   */
+  moveDir(path: string, to: string): Promise<TypedMutate> {
+    return this.issueMutate({ mutate: 'move_dir', path, to })
+  }
+
+  /**
+   * Issue a `mutate: delete_dir` — delete the folder `path` as ONE saga: every
+   * file the engine catalogues under it, then every directory that leaves empty.
+   * RAW, the folder sibling of `deleteFile`: no referrer is rewritten, so a
+   * reference into the folder from a surviving file dangles, reported in
+   * `result.stranded`. The delete proceeds whatever `stranded` holds; preview
+   * first with `readPreviewMutation({ op: 'delete_dir', ... })` for a
+   * confirmation step.
+   *
+   * No riders. Rejects on `moveDir`'s folder refusals, a dirty file, and a folder
+   * holding files that no git working tree covers. The success `result` adds
+   * `stranded`, `untracked_dirs`, and `last_live_commit` (present only when it
+   * committed) for a tombstone pin `[[<file>::@<last_live_commit>]]`. Resolves a
+   * typed outcome (see `TypedMutate`); rejects only on transport failure.
+   */
+  deleteDir(path: string): Promise<TypedMutate> {
+    return this.issueMutate({ mutate: 'delete_dir', path })
+  }
+
+  /**
    * Issue a `mutate: rename_type` — rename a type-def from `oldName` to
    * `newName`. The name derives from the filename, so the def file moves
    * (suffix and directory kept) and every reference follows, all as one saga
@@ -987,6 +1071,203 @@ export class DaemonClient {
       ...write,
       ...(options.expectedHash !== undefined ? { expected_hash: options.expectedHash } : {}),
     })
+  }
+
+  /**
+   * Issue a `mutate: add_dep` — add a `{ name, remote?, ref? }` entry to a
+   * repo's `deps:`, authoring `<member>/.arsumbris/repo.yaml`. `options.root`
+   * names the editable member to author (absent = the served entry).
+   *
+   * A COMPOSITION-sort mutation, a sort distinct from the graph and config
+   * mutations: it authors a repo's declared deps ([[spec - composition
+   * authorship]]). A guard-bypass like `setConfig` (the `.arsumbris/repo.yaml`
+   * path is built from a validated editable member root; a raw `writeFile` there
+   * still rejects), but UNLIKE the config sort the file is a first-class node, so
+   * the write re-resolves the mounted set and rebuilds; `deps` folds into the
+   * repo's closure-hash, so this is an identity change. Does NOT fetch: the newly
+   * declared peer stays `peer-unmounted` until `resolve`. A byte-splice, so
+   * comments and ordering survive; `deps:` is seeded when absent.
+   *
+   * The success `result` is the standard mutate envelope (`commit` / `commits`
+   * set, `hash` the written file's content hash for the next `expectedHash`).
+   * `options.expectedHash` is a compare-and-set. Rejects (as `{ ok: false }`,
+   * nothing written) a duplicate `name`, a non-editable or unknown member `root`,
+   * or an `expectedHash` mismatch. Additive — no `schema_version` bump. Resolves
+   * a typed outcome (see `TypedMutate`); rejects only on transport failure.
+   */
+  addRepoDependency(name: string, options: AddRepoDependencyOptions = {}): Promise<TypedMutate> {
+    return this.issueMutate({
+      mutate: 'add_dep',
+      name,
+      ...(options.remote !== undefined ? { remote: options.remote } : {}),
+      ...(options.ref !== undefined ? { ref: options.ref } : {}),
+      ...(options.root !== undefined ? { root: options.root } : {}),
+      ...(options.expectedHash !== undefined ? { expected_hash: options.expectedHash } : {}),
+    })
+  }
+
+  /**
+   * Issue a `mutate: remove_dep` — remove the `deps:` entry named `name` from a
+   * repo's `.arsumbris/repo.yaml`. The composition-sort dual of
+   * `addRepoDependency`; rebuilds the same way (an identity change). A byte-splice
+   * matching by `name`, siblings and comments survive, a sole entry collapses
+   * `deps:` to `[]`. `options.root` names the editable member (absent = the served
+   * entry); `options.expectedHash` is a compare-and-set.
+   *
+   * The success `result` is the standard mutate envelope. Rejects (as
+   * `{ ok: false }`, nothing written) an absent `name`, a non-editable or unknown
+   * member `root`, or an `expectedHash` mismatch. Additive — no `schema_version`
+   * bump. Resolves a typed outcome (see `TypedMutate`); rejects only on transport
+   * failure.
+   */
+  removeRepoDependency(name: string, options: CompositionMutateOptions = {}): Promise<TypedMutate> {
+    return this.issueMutate({
+      mutate: 'remove_dep',
+      name,
+      ...(options.root !== undefined ? { root: options.root } : {}),
+      ...(options.expectedHash !== undefined ? { expected_hash: options.expectedHash } : {}),
+    })
+  }
+
+  /**
+   * Issue a `mutate: add_workspace_member` — add `name` to a workspace's `edit:`
+   * or `discover:` list (`role`, see `WorkspaceRole`), authoring
+   * `<member>/.arsumbris/workspace.yaml`. `options.root` names the editable
+   * member (absent = the served entry); `options.expectedHash` is a
+   * compare-and-set.
+   *
+   * A COMPOSITION-sort mutation like `addRepoDependency`. When the file is ABSENT
+   * it is CREATED self-complete (`type: au.engine.workspace::au-engine`, the
+   * containing repo seeded into `edit:`, plus the member in its role); the engine
+   * re-reads it on the rebuild and switches into workspace mode. A byte-splice,
+   * comments preserved.
+   *
+   * The success `result` is the standard mutate envelope. Rejects (as
+   * `{ ok: false }`, nothing written) a member already in EITHER list (use
+   * `setWorkspaceMemberRole` to change a role), the containing repo into
+   * `discover`, a non-editable or unknown member `root`, or an `expectedHash`
+   * mismatch. Additive — no `schema_version` bump. Resolves a typed outcome (see
+   * `TypedMutate`); rejects only on transport failure.
+   */
+  addWorkspaceMember(name: string, role: WorkspaceRole, options: CompositionMutateOptions = {}): Promise<TypedMutate> {
+    return this.issueMutate({
+      mutate: 'add_workspace_member',
+      name,
+      role,
+      ...(options.root !== undefined ? { root: options.root } : {}),
+      ...(options.expectedHash !== undefined ? { expected_hash: options.expectedHash } : {}),
+    })
+  }
+
+  /**
+   * Issue a `mutate: remove_workspace_member` — remove `name` from whichever of
+   * `edit:` / `discover:` holds it in `<member>/.arsumbris/workspace.yaml`.
+   * `options.root` names the editable member (absent = the served entry);
+   * `options.expectedHash` is a compare-and-set.
+   *
+   * A COMPOSITION-sort mutation, the dual of `addWorkspaceMember`, a byte-splice
+   * with comments preserved. Removes `name` from EVERY list holding it: both
+   * role lists on a hand-authored conflict, plus `disabled:` if listed. The
+   * success `result` is the standard mutate envelope. Rejects (as
+   * `{ ok: false }`, nothing written) an absent member, the containing repo
+   * (it cannot leave `edit:`), a non-editable or unknown member `root`, or an
+   * `expectedHash` mismatch. Additive
+   * — no `schema_version` bump. Resolves a typed outcome (see `TypedMutate`);
+   * rejects only on transport failure.
+   */
+  removeWorkspaceMember(name: string, options: CompositionMutateOptions = {}): Promise<TypedMutate> {
+    return this.issueMutate({
+      mutate: 'remove_workspace_member',
+      name,
+      ...(options.root !== undefined ? { root: options.root } : {}),
+      ...(options.expectedHash !== undefined ? { expected_hash: options.expectedHash } : {}),
+    })
+  }
+
+  /**
+   * Issue a `mutate: set_workspace_member_role` — move `name` between `edit:` and
+   * `discover:` in one commit, `role` being the TARGET list (see `WorkspaceRole`).
+   * `options.root` names the editable member (absent = the served entry);
+   * `options.expectedHash` is a compare-and-set.
+   *
+   * A COMPOSITION-sort mutation, the role-change verb `addWorkspaceMember`'s
+   * reject points at. The success `result` is the standard mutate envelope.
+   * Rejects (as `{ ok: false }`, nothing written) an absent member, a member
+   * already in the target role, the containing repo into `discover`, a
+   * non-editable or unknown member `root`, or an `expectedHash` mismatch. Additive
+   * — no `schema_version` bump. Resolves a typed outcome (see `TypedMutate`);
+   * rejects only on transport failure.
+   */
+  setWorkspaceMemberRole(
+    name: string,
+    role: WorkspaceRole,
+    options: CompositionMutateOptions = {},
+  ): Promise<TypedMutate> {
+    return this.issueMutate({
+      mutate: 'set_workspace_member_role',
+      name,
+      role,
+      ...(options.root !== undefined ? { root: options.root } : {}),
+      ...(options.expectedHash !== undefined ? { expected_hash: options.expectedHash } : {}),
+    })
+  }
+
+  /**
+   * Issue a `mutate: set_workspace_member_disabled` — switch a declared member
+   * off (`disabled: true`, appended to `<member>/.arsumbris/workspace.yaml`'s
+   * `disabled:` overlay) or back on (`disabled: false`, removed from it).
+   * `options.root` names the editable member (absent = the served entry);
+   * `options.expectedHash` is a compare-and-set.
+   *
+   * A COMPOSITION-sort mutation like the other workspace verbs, a byte-splice
+   * with comments preserved. The role lists are untouched: a disabled member
+   * keeps its declared `edit` / `discover` role, as the `members` read reports
+   * it. Re-enabling the last disabled member leaves `disabled: []`.
+   *
+   * The success `result` is the standard mutate envelope. Rejects (as
+   * `{ ok: false }`, nothing written) an absent `workspace.yaml`; disabling the
+   * containing repo, a name in neither `edit:` nor `discover:`, or one already
+   * disabled; re-enabling a name not in `disabled:`; a non-editable or unknown
+   * member `root`; or an `expectedHash` mismatch. Additive — no
+   * `schema_version` bump. Resolves a typed outcome (see `TypedMutate`); rejects
+   * only on transport failure.
+   */
+  setWorkspaceMemberDisabled(
+    name: string,
+    disabled: boolean,
+    options: CompositionMutateOptions = {},
+  ): Promise<TypedMutate> {
+    return this.issueMutate({
+      mutate: 'set_workspace_member_disabled',
+      name,
+      disabled,
+      ...(options.root !== undefined ? { root: options.root } : {}),
+      ...(options.expectedHash !== undefined ? { expected_hash: options.expectedHash } : {}),
+    })
+  }
+
+  /**
+   * Issue a mutation by its raw wire `verb`, splatting `args` onto the frame.
+   * The RAW door beneath the typed helpers: every typed mutation
+   * (`writeFile` / `addRepoDependency` / `promote` / ...) is sugar over this same
+   * `{ mutate: verb, ...args }` frame.
+   *
+   * Operates in WIRE space, not the SDK's normalized edge: `verb` is a `mutate`
+   * catalog verb, and `args` are keyed by that verb's OWN wire argument names
+   * (snake_case, e.g. `add_dep`'s `{ name, root }`, `edit_file`'s
+   * `{ path, old_string, new_string }`), with wire-shaped values — NOT the
+   * camelCase options a typed helper takes. No arg normalization or validation
+   * happens here; the engine validates the frame on receipt (an unknown verb or
+   * arg is a reject, surfaced as `{ ok: false }`).
+   *
+   * Prefer a typed helper when one exists. Reach for this when the verb is only
+   * known at RUNTIME — the engine-authored actions on a diagnostic's
+   * `fix.actions[]`, whose `{ verb, args }` are already wire-shaped and meant to
+   * splat straight in. See the consumer-facing `appliableFix`. Resolves a typed
+   * outcome (see `TypedMutate`); rejects only on transport failure.
+   */
+  mutateByVerb(verb: string, args: Record<string, unknown> = {}): Promise<TypedMutate> {
+    return this.issueMutate({ mutate: verb, ...args })
   }
 
   /**
